@@ -149,6 +149,124 @@ def sky_prob_vectorized(ra_deg: np.ndarray, dec_deg: np.ndarray,
     return prob_map[ipix_array]
 
 
+def conditional_distance_pdf(r: np.ndarray, mu: np.ndarray, 
+                             sigma: np.ndarray, norm: np.ndarray) -> np.ndarray:
+    """
+    Compute conditional distance PDF p(r|pixel) = norm * r^2 * exp(-(r-mu)^2/(2*sigma^2)).
+    
+    Parameters
+    ----------
+    r : np.ndarray
+        Distance values (Mpc), shape (n_galaxies,)
+    mu : np.ndarray
+        Distance mean for each pixel (Mpc), shape (n_galaxies,)
+    sigma : np.ndarray
+        Distance sigma for each pixel (Mpc), shape (n_galaxies,)
+    norm : np.ndarray
+        Normalization constant for each pixel (Mpc^-2), shape (n_galaxies,)
+    
+    Returns
+    -------
+    np.ndarray
+        Conditional PDF values, shape (n_galaxies,)
+        Returns 0 for r <= 0, sigma <= 0, or norm == 0
+    """
+    # Initialize result array
+    result = np.zeros_like(r)
+    
+    # Filter valid entries: r > 0, sigma > 0, norm > 0, all finite
+    mask_valid = (
+        (r > 0) & 
+        (sigma > 0) & 
+        (norm > 0) &
+        np.isfinite(r) & np.isfinite(mu) & np.isfinite(sigma) & np.isfinite(norm)
+    )
+    
+    if not np.any(mask_valid):
+        return result
+    
+    # Compute conditional PDF: norm * r^2 * exp(-(r-mu)^2/(2*sigma^2))
+    r_valid = r[mask_valid]
+    mu_valid = mu[mask_valid]
+    sigma_valid = sigma[mask_valid]
+    norm_valid = norm[mask_valid]
+    
+    # Compute exponent: -(r-mu)^2/(2*sigma^2)
+    diff = r_valid - mu_valid
+    exponent = -0.5 * (diff / sigma_valid) ** 2
+    
+    # Compute PDF: norm * r^2 * exp(exponent)
+    # Note: norm already includes the normalization, so we don't need 1/(sqrt(2*pi)*sigma)
+    result[mask_valid] = norm_valid * (r_valid ** 2) * np.exp(exponent)
+    
+    # Ensure no inf/nan
+    result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    return result
+
+
+def sky_prob_and_distparams_vectorized(ra_deg: np.ndarray, dec_deg: np.ndarray,
+                                       prob_map: np.ndarray, distmu_map: np.ndarray,
+                                       distsigma_map: np.ndarray, distnorm_map: np.ndarray,
+                                       metadata: dict, hp_obj=None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Vectorized version: get sky probabilities and distance parameters for arrays of coordinates.
+    
+    Parameters
+    ----------
+    ra_deg : np.ndarray
+        Array of right ascensions in degrees
+    dec_deg : np.ndarray
+        Array of declinations in degrees
+    prob_map : np.ndarray
+        HEALPix probability density map (PROBDENSITY)
+    distmu_map : np.ndarray
+        HEALPix distance mean map (DISTMU, Mpc, linear)
+    distsigma_map : np.ndarray
+        HEALPix distance sigma map (DISTSIGMA, Mpc, linear)
+    distnorm_map : np.ndarray
+        HEALPix distance normalization map (DISTNORM, Mpc^-2)
+    metadata : dict
+        Metadata with 'nside' and 'nest' keys
+    hp_obj : optional
+        Pre-created HEALPix object
+    
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        (prob_pix, mu_pix, sigma_pix, norm_pix) - all arrays of shape (n_galaxies,)
+    """
+    from astropy_healpix import HEALPix
+    from astropy import units as u
+    from astropy.coordinates import SkyCoord
+    
+    if hp_obj is None:
+        nside = metadata.get('nside', 512)
+        nested = metadata.get('nest', False)
+        hp_obj = HEALPix(nside=nside, order='nested' if nested else 'ring', frame='icrs')
+    
+    # Convert to SkyCoord (vectorized)
+    coords = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame='icrs')
+    
+    # Find pixel indices (vectorized)
+    ipix_array = hp_obj.lonlat_to_healpix(coords.ra, coords.dec)
+    
+    # Handle both scalar and array returns
+    if not isinstance(ipix_array, np.ndarray):
+        ipix_array = np.array([ipix_array])
+    
+    # Clip indices to valid range
+    ipix_array = np.clip(ipix_array, 0, len(prob_map) - 1)
+    
+    # Return probability densities and distance parameters
+    prob_pix = prob_map[ipix_array]
+    mu_pix = distmu_map[ipix_array]
+    sigma_pix = distsigma_map[ipix_array]
+    norm_pix = distnorm_map[ipix_array]
+    
+    return prob_pix, mu_pix, sigma_pix, norm_pix
+
+
 def interp_pdf_vectorized(x_grid: np.ndarray, pdf_grid: np.ndarray, 
                           x_array: np.ndarray) -> np.ndarray:
     """
@@ -206,7 +324,8 @@ def event_likelihood(H0_grid: np.ndarray, galaxies: np.ndarray,
                     model: str = "std", kappa: float = 1.0,
                     Om: float = 0.3,
                     distance_pdf_kind: str = "likelihood",
-                    d_min: float = 1.0) -> np.ndarray:
+                    d_min: float = 1.0,
+                    use_3d_skymap: bool = False) -> np.ndarray:
     """
     Compute event likelihood L(H0) for a grid of H0 values (OPTIMIZED VERSION).
     
@@ -219,9 +338,11 @@ def event_likelihood(H0_grid: np.ndarray, galaxies: np.ndarray,
     galaxies : np.ndarray
         Structured array with fields: 'ra_deg', 'dec_deg', 'z', 'weight'
         (weight defaults to 1.0 if not present)
-    sky_prob_func : Callable[[float, float], float]
+    sky_prob_func : Callable[[float, float], float] or tuple
         Function that returns p(Ω) given (ra_deg, dec_deg)
-        OR (prob_map, metadata, hp_obj) tuple for vectorized version
+        OR tuple for vectorized version:
+        - Separable mode: (prob_map, metadata, hp_obj)
+        - 3D skymap mode: (prob_map, distmu_map, distsigma_map, distnorm_map, metadata, hp_obj)
     d_grid : np.ndarray
         Distance grid for PDF (Mpc)
     d_pdf : np.ndarray
@@ -239,9 +360,15 @@ def event_likelihood(H0_grid: np.ndarray, galaxies: np.ndarray,
         Type of distance PDF: "likelihood" or "posterior_d2", by default "likelihood"
         - "likelihood": d_pdf is already GW likelihood (prior removed)
         - "posterior_d2": d_pdf is GW posterior with d^2 volumetric prior, will be converted
+        Only used if use_3d_skymap=False
     d_min : float, optional
         Minimum distance for regularization near zero (Mpc), by default 1.0
         Used to avoid division by zero when removing d^2 prior
+        Only used if use_3d_skymap=False
+    use_3d_skymap : bool, optional
+        If True, use 3D skymap likelihood p(Ω, r) directly from FITS columns.
+        Requires sky_prob_func to be tuple: (prob_map, distmu_map, distsigma_map, distnorm_map, metadata, hp_obj)
+        If False, use separable approximation p(Ω) * p(r) with d_grid/d_pdf
     
     Returns
     -------
@@ -283,11 +410,42 @@ def event_likelihood(H0_grid: np.ndarray, galaxies: np.ndarray,
     
     print(f"    Processing {len(ra_array):,} valid galaxies...", flush=True)
     
-    # Pre-compute sky probabilities for all galaxies (vectorized if possible)
-    # Try to get prob_map and metadata from sky_prob_func if it's a tuple
-    if isinstance(sky_prob_func, tuple) and len(sky_prob_func) == 3:
+    # Determine if using 3D skymap mode
+    is_3d_mode = use_3d_skymap and isinstance(sky_prob_func, tuple) and len(sky_prob_func) == 6
+    
+    if is_3d_mode:
+        # 3D skymap mode: extract distance parameters from FITS
+        prob_map, distmu_map, distsigma_map, distnorm_map, metadata, hp_obj = sky_prob_func
+        print(f"    Using 3D skymap mode: computing sky prob and distance params (vectorized)...", flush=True)
+        
+        # Get sky probabilities and distance parameters for all galaxies
+        prob_pix, mu_pix, sigma_pix, norm_pix = sky_prob_and_distparams_vectorized(
+            ra_array, dec_array, prob_map, distmu_map, distsigma_map, distnorm_map, metadata, hp_obj
+        )
+        
+        # Diagnostic: check for invalid pixels
+        mask_invalid_pix = (norm_pix == 0) | ~np.isfinite(mu_pix) | (sigma_pix <= 0)
+        n_invalid_pix = mask_invalid_pix.sum()
+        if n_invalid_pix > 0:
+            print(f"    WARNING: {n_invalid_pix:,} pixels ({100*n_invalid_pix/len(prob_pix):.2f}%) have invalid distance params", flush=True)
+        
+        # Filter galaxies with zero sky probability
+        mask_nonzero_sky = prob_pix > 0
+        ra_array = ra_array[mask_nonzero_sky]
+        dec_array = dec_array[mask_nonzero_sky]
+        z_array = z_array[mask_nonzero_sky]
+        weight_array = weight_array[mask_nonzero_sky]
+        prob_pix = prob_pix[mask_nonzero_sky]
+        mu_pix = mu_pix[mask_nonzero_sky]
+        sigma_pix = sigma_pix[mask_nonzero_sky]
+        norm_pix = norm_pix[mask_nonzero_sky]
+        
+        p_sky_array = prob_pix  # For consistency with variable name
+        
+    elif isinstance(sky_prob_func, tuple) and len(sky_prob_func) == 3:
+        # Separable mode with vectorized sky probabilities
         prob_map, metadata, hp_obj = sky_prob_func
-        print(f"    Computing sky probabilities (vectorized)...", flush=True)
+        print(f"    Using separable mode: computing sky probabilities (vectorized)...", flush=True)
         p_sky_array = sky_prob_vectorized(ra_array, dec_array, prob_map, metadata, hp_obj)
     else:
         # Fallback: compute one by one (slower)
@@ -343,34 +501,59 @@ def event_likelihood(H0_grid: np.ndarray, galaxies: np.ndarray,
         else:
             raise ValueError(f"Unknown model: {model}")
         
-        # Compute distance probabilities (vectorized)
-        p_d_array = interp_pdf_vectorized(d_grid, d_pdf, d_L_array)
-        
-        # Remove volumetric prior if d_pdf is posterior
-        if distance_pdf_kind == "posterior_d2":
-            # Compute effective distance with regularization
-            d_eff = np.maximum(d_L_array, d_min)
-            # Remove d^2 prior: p_like(d) = p_post(d) / d^2
-            p_d_array = p_d_array / (d_eff ** 2)
-            # Guard against inf/nan
-            p_d_array = np.nan_to_num(p_d_array, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Diagnostic: log statistics for first H0 value
-        if i == 0:
-            d_L_mode = np.median(d_L_array) if len(d_L_array) > 0 else 0.0
-            d_L_min = np.min(d_L_array) if len(d_L_array) > 0 else 0.0
-            d_L_max = np.max(d_L_array) if len(d_L_array) > 0 else 0.0
-            p_d_min = np.min(p_d_array[p_d_array > 0]) if np.any(p_d_array > 0) else 0.0
-            p_d_max = np.max(p_d_array) if len(p_d_array) > 0 else 0.0
-            print(f"    Diagnostic (H0={H0:.1f}): d_L range=[{d_L_min:.1f}, {d_L_mode:.1f}, {d_L_max:.1f}] Mpc, "
-                  f"p_d range=[{p_d_min:.2e}, {p_d_max:.2e}]", flush=True)
+        # Compute distance probabilities
+        if is_3d_mode:
+            # 3D skymap mode: use conditional distance PDF p(r|pixel)
+            p_d_array = conditional_distance_pdf(d_L_array, mu_pix, sigma_pix, norm_pix)
+            
+            # Diagnostic for first H0 value
+            if i == 0:
+                d_L_mode = np.median(d_L_array) if len(d_L_array) > 0 else 0.0
+                d_L_min = np.min(d_L_array) if len(d_L_array) > 0 else 0.0
+                d_L_max = np.max(d_L_array) if len(d_L_array) > 0 else 0.0
+                p_d_nonzero = p_d_array[p_d_array > 0]
+                if len(p_d_nonzero) > 0:
+                    p_d_min = np.min(p_d_nonzero)
+                    p_d_max = np.max(p_d_nonzero)
+                    p_d_p50 = np.percentile(p_d_nonzero, 50)
+                    p_d_p95 = np.percentile(p_d_nonzero, 95)
+                    print(f"    Diagnostic (H0={H0:.1f}, 3D mode): d_L range=[{d_L_min:.1f}, {d_L_mode:.1f}, {d_L_max:.1f}] Mpc, "
+                          f"p_r range=[{p_d_min:.2e}, {p_d_p50:.2e}, {p_d_max:.2e}], "
+                          f"p95={p_d_p95:.2e}", flush=True)
+                else:
+                    print(f"    Diagnostic (H0={H0:.1f}, 3D mode): d_L range=[{d_L_min:.1f}, {d_L_mode:.1f}, {d_L_max:.1f}] Mpc, "
+                          f"p_r: all zero!", flush=True)
+        else:
+            # Separable mode: interpolate from distance PDF
+            p_d_array = interp_pdf_vectorized(d_grid, d_pdf, d_L_array)
+            
+            # Remove volumetric prior if d_pdf is posterior
+            if distance_pdf_kind == "posterior_d2":
+                # Compute effective distance with regularization
+                d_eff = np.maximum(d_L_array, d_min)
+                # Remove d^2 prior: p_like(d) = p_post(d) / d^2
+                p_d_array = p_d_array / (d_eff ** 2)
+                # Guard against inf/nan
+                p_d_array = np.nan_to_num(p_d_array, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Diagnostic: log statistics for first H0 value
+            if i == 0:
+                d_L_mode = np.median(d_L_array) if len(d_L_array) > 0 else 0.0
+                d_L_min = np.min(d_L_array) if len(d_L_array) > 0 else 0.0
+                d_L_max = np.max(d_L_array) if len(d_L_array) > 0 else 0.0
+                p_d_min = np.min(p_d_array[p_d_array > 0]) if np.any(p_d_array > 0) else 0.0
+                p_d_max = np.max(p_d_array) if len(p_d_array) > 0 else 0.0
+                print(f"    Diagnostic (H0={H0:.1f}, separable mode): d_L range=[{d_L_min:.1f}, {d_L_mode:.1f}, {d_L_max:.1f}] Mpc, "
+                      f"p_d range=[{p_d_min:.2e}, {p_d_max:.2e}]", flush=True)
         
         # Guardrail: ensure all values are finite
         assert np.all(np.isfinite(p_d_array)), (
             f"Non-finite values in p_d_array at H0={H0:.1f}. "
-            f"distance_pdf_kind={distance_pdf_kind}, "
+            f"mode={'3D' if is_3d_mode else 'separable'}, "
             f"d_L range=[{np.min(d_L_array):.1f}, {np.max(d_L_array):.1f}] Mpc"
         )
+        assert np.all(np.isfinite(d_L_array)), f"Non-finite values in d_L_array at H0={H0:.1f}"
+        assert np.all(np.isfinite(ddL_dz_array)), f"Non-finite values in ddL_dz_array at H0={H0:.1f}"
         
         # Filter galaxies with zero distance probability
         mask_nonzero_d = p_d_array > 0
@@ -378,9 +561,9 @@ def event_likelihood(H0_grid: np.ndarray, galaxies: np.ndarray,
             likelihood[i] = 0.0
             continue
         
-        # Compute contributions with Jacobian: p(d) * ddL/dz
-        # This accounts for the change of variables from z to d_L
-        # Note: p_d_array is now GW likelihood (prior removed if needed)
+        # Compute contributions with Jacobian: p(Ω, d) * ddL/dz
+        # For 3D mode: p(Ω, d) = prob_pix * p_r (already computed)
+        # For separable mode: p(Ω, d) = p_sky * p_d
         
         contributions = (
             weight_array[mask_nonzero_d] * 

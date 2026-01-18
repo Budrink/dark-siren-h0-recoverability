@@ -62,6 +62,99 @@ def load_skymap(fits_path: Path):
     return prob, metadata, hp_obj
 
 
+def load_3d_skymap(fits_path: Path):
+    """
+    Load 3D skymap with distance information.
+    
+    Returns
+    -------
+    tuple
+        (prob_map, distmu_map, distsigma_map, distnorm_map, metadata, hp_obj)
+    """
+    from astropy.io import fits
+    
+    with fits.open(str(fits_path)) as hdul:
+        hdu = hdul[1]
+        
+        # Check for 3D distance information
+        if 'DISTMU' not in hdu.data.dtype.names:
+            raise ValueError(f"Distance information (DISTMU) not found in FITS file: {fits_path}")
+        
+        # Extract arrays - handle both regular HEALPix and UNIQ formats
+        if 'UNIQ' in hdu.data.dtype.names:
+            # UNIQ format: need to convert to regular HEALPix
+            # For now, use the same approach as read_skymap_astropy
+            # Extract raw arrays
+            prob_raw = hdu.data['PROBDENSITY']
+            distmu_raw = hdu.data['DISTMU']
+            distsigma_raw = hdu.data['DISTSIGMA']
+            distnorm_raw = hdu.data['DISTNORM']
+            uniq = hdu.data['UNIQ']
+            
+            # Convert UNIQ to regular HEALPix grid (target nside=512)
+            target_nside = 512
+            hp_target = HEALPix(nside=target_nside, order='nested', frame='icrs')
+            npix_target = hp_target.npix
+            
+            prob_map = np.zeros(npix_target)
+            distmu_map = np.zeros(npix_target)
+            distsigma_map = np.zeros(npix_target)
+            distnorm_map = np.zeros(npix_target)
+            
+            # Decode UNIQ and accumulate values
+            for i in range(len(uniq)):
+                u = uniq[i]
+                p = prob_raw[i] if i < len(prob_raw) else 0.0
+                mu = distmu_raw[i] if i < len(distmu_raw) else 0.0
+                sigma = distsigma_raw[i] if i < len(distsigma_raw) else 0.0
+                norm = distnorm_raw[i] if i < len(distnorm_raw) else 0.0
+                
+                # Decode UNIQ
+                level = 0
+                while 4 * (4 ** (level + 1)) <= u:
+                    level += 1
+                nside_u = 2 ** level
+                ipix_u = u - 4 * (4 ** level)
+                
+                # Get pixel center coordinates
+                hp_source = HEALPix(nside=nside_u, order='nested', frame='icrs')
+                lon_u, lat_u = hp_source.healpix_to_lonlat([ipix_u])
+                
+                # Find target pixel
+                ipix_target = hp_target.lonlat_to_healpix(lon_u, lat_u)[0]
+                
+                # Accumulate values (use max for prob, mean for distance params)
+                if ipix_target < npix_target:
+                    prob_map[ipix_target] = max(prob_map[ipix_target], p)
+                    if distmu_map[ipix_target] == 0 or mu > 0:
+                        distmu_map[ipix_target] = mu if mu > 0 else distmu_map[ipix_target]
+                        distsigma_map[ipix_target] = sigma if sigma > 0 else distsigma_map[ipix_target]
+                        distnorm_map[ipix_target] = norm if norm > 0 else distnorm_map[ipix_target]
+            
+            metadata = {'nside': target_nside, 'nest': True}
+            hp_obj = HEALPix(nside=target_nside, order='nested', frame='icrs')
+        else:
+            # Regular HEALPix format
+            prob_map = hdu.data['PROBDENSITY']
+            distmu_map = hdu.data['DISTMU']
+            distsigma_map = hdu.data['DISTSIGMA']
+            distnorm_map = hdu.data['DISTNORM']
+            
+            # Get metadata
+            if LIGO_SKYMAP_AVAILABLE:
+                # Try to use ligo.skymap for metadata
+                prob_temp, metadata = read_skymap_ligo(fits_path)
+                hp_obj = None
+            else:
+                # Use astropy fallback
+                nside = hdu.header.get('NSIDE', 512)
+                nested = hdu.header.get('NESTED', False)
+                metadata = {'nside': nside, 'nest': bool(nested)}
+                hp_obj = HEALPix(nside=nside, order='nested' if nested else 'ring', frame='icrs')
+    
+    return prob_map, distmu_map, distsigma_map, distnorm_map, metadata, hp_obj
+
+
 def create_sky_prob_func(prob_map: np.ndarray, metadata: dict, hp_obj) -> callable:
     """Create a function that returns p(Ω) given (ra_deg, dec_deg)."""
     def sky_prob(ra_deg: float, dec_deg: float) -> float:
@@ -268,6 +361,12 @@ def main():
         default=False,
         help='Use GW posterior directly (includes d^2 prior). Default: use GW likelihood (prior removed)'
     )
+    parser.add_argument(
+        '--compare-3d',
+        action='store_true',
+        default=False,
+        help='Compare separable vs 3D skymap modes. Plots both posteriors on same figure.'
+    )
     args = parser.parse_args()
     
     # Set use_gw_likelihood based on flag (default True, False if --use-gw-posterior)
@@ -322,6 +421,21 @@ def main():
     print(f"Step 1: Load skymap", flush=True)
     prob_map, metadata, hp_obj = load_skymap(fits_path)
     print(f"  Skymap loaded: nside={metadata.get('nside', 'unknown')}", flush=True)
+    
+    # Load 3D skymap if comparing modes
+    if args.compare_3d:
+        print(f"  Loading 3D skymap (with distance info)...", flush=True)
+        try:
+            prob_map_3d, distmu_map, distsigma_map, distnorm_map, metadata_3d, hp_obj_3d = load_3d_skymap(fits_path)
+            print(f"  3D skymap loaded: nside={metadata_3d.get('nside', 'unknown')}", flush=True)
+            # Use 3D metadata/hp_obj if available, otherwise fall back to 2D
+            if hp_obj_3d is not None:
+                metadata = metadata_3d
+                hp_obj = hp_obj_3d
+        except Exception as e:
+            print(f"  WARNING: Failed to load 3D skymap: {e}", flush=True)
+            print(f"  Falling back to separable mode only", flush=True)
+            args.compare_3d = False
     
     # Step 2: Load distance PDF
     print(f"Step 2: Load distance PDF", flush=True)
@@ -506,8 +620,18 @@ def main():
             print(f"    Scaling check: ddL/dz(60)/ddL/dz(120) = {ratio_actual:.3f} (expected ~{ratio_expected:.3f})", flush=True)
     
     # Step 5: Compute likelihoods
-    # Pass (prob_map, metadata, hp_obj) tuple for vectorized processing
+    # Prepare sky_prob_data tuple for vectorized processing
     sky_prob_data = (prob_map, metadata, hp_obj)
+    
+    # Prepare 3D skymap data if comparing
+    sky_prob_data_3d = None
+    if args.compare_3d:
+        try:
+            sky_prob_data_3d = (prob_map_3d, distmu_map, distsigma_map, distnorm_map, metadata, hp_obj)
+            print(f"  3D skymap data prepared for comparison", flush=True)
+        except NameError:
+            print(f"  WARNING: 3D skymap data not available, skipping comparison", flush=True)
+            args.compare_3d = False
     
     print(f"Step 5: Compute likelihoods", flush=True)
     results = {}
@@ -521,12 +645,48 @@ def main():
         print(f"  Using distance PDF as GW posterior (will remove d^2 prior)", flush=True)
     
     if args.model in ['std', 'both']:
-        print(f"  Computing std model...", flush=True)
+        print(f"  Computing std model (separable mode)...", flush=True)
         likelihood_std = event_likelihood(
             H0_grid, galaxies, sky_prob_data, d_grid, d_pdf,
             model='std', Om=0.3,
-            distance_pdf_kind=distance_pdf_kind, d_min=1.0
+            distance_pdf_kind=distance_pdf_kind, d_min=1.0,
+            use_3d_skymap=False
         )
+        posterior_std, norm_std = normalize_posterior(likelihood_std, H0_grid)
+        results['std'] = (posterior_std, norm_std, likelihood_std)
+        print(f"    Normalization: {norm_std:.2e}")
+        
+        # Likelihood slope check
+        print(f"    Likelihood slope check:")
+        print(f"      L(H0_min={args.h0_min:.1f}) = {likelihood_std[0]:.2e}")
+        mid_idx = len(H0_grid) // 2
+        print(f"      L(H0_mid={H0_grid[mid_idx]:.1f}) = {likelihood_std[mid_idx]:.2e}")
+        print(f"      L(H0_max={args.h0_max:.1f}) = {likelihood_std[-1]:.2e}")
+        
+        # Find MAP
+        map_idx = np.argmax(posterior_std)
+        H0_map = H0_grid[map_idx]
+        is_boundary = (map_idx == 0) or (map_idx == len(H0_grid) - 1)
+        print(f"      MAP H0 = {H0_map:.1f} km/s/Mpc {'(BOUNDARY!)' if is_boundary else ''}")
+        
+        # Compute 3D skymap mode if comparing
+        if args.compare_3d and sky_prob_data_3d is not None:
+            print(f"  Computing std model (3D skymap mode)...", flush=True)
+            likelihood_std_3d = event_likelihood(
+                H0_grid, galaxies, sky_prob_data_3d, d_grid, d_pdf,
+                model='std', Om=0.3,
+                distance_pdf_kind=distance_pdf_kind, d_min=1.0,
+                use_3d_skymap=True
+            )
+            posterior_std_3d, norm_std_3d = normalize_posterior(likelihood_std_3d, H0_grid)
+            results['std_3d'] = (posterior_std_3d, norm_std_3d, likelihood_std_3d)
+            print(f"    Normalization (3D): {norm_std_3d:.2e}")
+            
+            # Find MAP for 3D mode
+            map_idx_3d = np.argmax(posterior_std_3d)
+            H0_map_3d = H0_grid[map_idx_3d]
+            is_boundary_3d = (map_idx_3d == 0) or (map_idx_3d == len(H0_grid) - 1)
+            print(f"      MAP H0 (3D) = {H0_map_3d:.1f} km/s/Mpc {'(BOUNDARY!)' if is_boundary_3d else ''}")
         posterior_std, norm_std = normalize_posterior(likelihood_std, H0_grid)
         results['std'] = (posterior_std, norm_std, likelihood_std)
         print(f"    Normalization: {norm_std:.2e}")
@@ -553,13 +713,14 @@ def main():
             kappa_values = [args.kappa]
             print(f"  Computing ell model (kappa={args.kappa})...", flush=True)
         
-        # Compute likelihoods for each kappa value
+        # Compute likelihoods for each kappa value (separable mode)
         for kappa in kappa_values:
-            print(f"    Computing kappa={kappa}...", flush=True)
+            print(f"    Computing kappa={kappa} (separable mode)...", flush=True)
             likelihood_ell = event_likelihood(
                 H0_grid, galaxies, sky_prob_data, d_grid, d_pdf,
                 model='ell', kappa=kappa, Om=0.3,
-                distance_pdf_kind=distance_pdf_kind, d_min=1.0
+                distance_pdf_kind=distance_pdf_kind, d_min=1.0,
+                use_3d_skymap=False
             )
             posterior_ell, norm_ell = normalize_posterior(likelihood_ell, H0_grid)
             
@@ -581,6 +742,29 @@ def main():
             H0_map = H0_grid[map_idx]
             is_boundary = (map_idx == 0) or (map_idx == len(H0_grid) - 1)
             print(f"        MAP H0 = {H0_map:.1f} km/s/Mpc {'(BOUNDARY!)' if is_boundary else ''}", flush=True)
+            
+            # Compute 3D skymap mode if comparing
+            if args.compare_3d and sky_prob_data_3d is not None:
+                print(f"    Computing kappa={kappa} (3D skymap mode)...", flush=True)
+                likelihood_ell_3d = event_likelihood(
+                    H0_grid, galaxies, sky_prob_data_3d, d_grid, d_pdf,
+                    model='ell', kappa=kappa, Om=0.3,
+                    distance_pdf_kind=distance_pdf_kind, d_min=1.0,
+                    use_3d_skymap=True
+                )
+                posterior_ell_3d, norm_ell_3d = normalize_posterior(likelihood_ell_3d, H0_grid)
+                
+                # Store results with kappa and 3d suffix
+                key_3d = f'ell_kappa_{kappa}_3d'
+                results[key_3d] = (posterior_ell_3d, norm_ell_3d, likelihood_ell_3d, kappa)
+                
+                print(f"      Normalization (3D): {norm_ell_3d:.2e}", flush=True)
+                
+                # Find MAP for 3D mode
+                map_idx_3d = np.argmax(posterior_ell_3d)
+                H0_map_3d = H0_grid[map_idx_3d]
+                is_boundary_3d = (map_idx_3d == 0) or (map_idx_3d == len(H0_grid) - 1)
+                print(f"        MAP H0 (3D) = {H0_map_3d:.1f} km/s/Mpc {'(BOUNDARY!)' if is_boundary_3d else ''}", flush=True)
     
     # Step 6: Plot
     print(f"Step 6: Plot posterior")
@@ -605,25 +789,30 @@ def main():
                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
     
     # Plot all ELL models (with different kappa values)
-    ell_keys = [k for k in results.keys() if k.startswith('ell_kappa_')]
-    if ell_keys:
-        # Sort by kappa value
-        ell_keys_sorted = sorted(ell_keys, key=lambda k: float(k.split('_')[-1]))
+    # Separate separable and 3D ELL models
+    ell_keys_sep = [k for k in results.keys() if k.startswith('ell_kappa_') and not k.endswith('_3d')]
+    ell_keys_3d = [k for k in results.keys() if k.startswith('ell_kappa_') and k.endswith('_3d')]
+    
+    # Colors and styles for different kappa values
+    colors_sep = ['red', 'orange', 'purple']
+    colors_3d = ['darkred', 'darkorange', 'darkviolet']
+    linestyles_sep = ['--', '-.', ':']
+    linestyles_3d = ['--', '-.', ':']  # Same styles but different colors
+    
+    # Plot separable ELL models
+    if ell_keys_sep:
+        ell_keys_sep_sorted = sorted(ell_keys_sep, key=lambda k: float(k.split('_')[-1]))
         
-        # Colors and styles for different kappa values
-        colors = ['red', 'orange', 'purple']
-        linestyles = ['--', '-.', ':']
-        
-        for idx, key in enumerate(ell_keys_sorted):
+        for idx, key in enumerate(ell_keys_sep_sorted):
             posterior_ell, _, likelihood_ell, kappa = results[key]
-            color = colors[idx % len(colors)]
-            linestyle = linestyles[idx % len(linestyles)]
+            color = colors_sep[idx % len(colors_sep)]
+            linestyle = linestyles_sep[idx % len(linestyles_sep)]
             
             # Special label for kappa=0 (should match STD)
             if kappa == 0.0:
-                label = f'ELL (κ={kappa:.1f}, should match STD)'
+                label = f'ELL separable (κ={kappa:.1f})'
             else:
-                label = f'ELL (κ={kappa:.1f})'
+                label = f'ELL separable (κ={kappa:.1f})'
             
             ax.plot(H0_grid, posterior_ell, color=color, linestyle=linestyle, 
                    linewidth=2, label=label, alpha=0.8)
@@ -644,6 +833,36 @@ def main():
                    rotation=90, verticalalignment='top', fontsize=9, color=color,
                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
     
+    # Plot 3D ELL models if comparing
+    if args.compare_3d and ell_keys_3d:
+        ell_keys_3d_sorted = sorted(ell_keys_3d, key=lambda k: float(k.split('_')[-2]))  # Extract kappa before '_3d'
+        
+        for idx, key in enumerate(ell_keys_3d_sorted):
+            posterior_ell_3d, _, likelihood_ell_3d, kappa = results[key]
+            color = colors_3d[idx % len(colors_3d)]
+            linestyle = linestyles_3d[idx % len(linestyles_3d)]
+            
+            label = f'ELL 3D (κ={kappa:.1f})'
+            
+            ax.plot(H0_grid, posterior_ell_3d, color=color, linestyle=linestyle, 
+                   linewidth=2, label=label, alpha=0.8)
+            ax.fill_between(H0_grid, posterior_ell_3d, alpha=0.1, color=color)
+            
+            # Add vertical line at MAP
+            map_idx = np.argmax(posterior_ell_3d)
+            H0_map_ell_3d = H0_grid[map_idx]
+            is_boundary_ell_3d = (map_idx == 0) or (map_idx == len(H0_grid) - 1)
+            ax.axvline(H0_map_ell_3d, color=color, linestyle=linestyle, 
+                      linewidth=1.5, alpha=0.7)
+            label_map = f'MAP={H0_map_ell_3d:.1f}'
+            if is_boundary_ell_3d:
+                label_map += ' (boundary)'
+            y_max = ax.get_ylim()[1]
+            y_pos = y_max * (0.5 - idx * 0.1)  # Stagger vertical lines lower
+            ax.text(H0_map_ell_3d, y_pos, label_map, 
+                   rotation=90, verticalalignment='top', fontsize=9, color=color,
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
+    
     ax.set_xlabel('H₀ (km/s/Mpc)', fontsize=12)
     ax.set_ylabel('Posterior P(H₀)', fontsize=12)
     ax.set_title(f'H₀ Posterior: {args.event}', fontsize=14)
@@ -651,8 +870,11 @@ def main():
     ax.legend(fontsize=11)
     
     # Add note about MVP limitations
-    ax.text(0.02, 0.98, 
-           'MVP: Ignores selection effects\nand out-of-catalog term',
+    if args.compare_3d:
+        note_text = 'Comparison: MVP separable vs 3D skymap\nIgnores selection effects and out-of-catalog term'
+    else:
+        note_text = 'MVP: Ignores selection effects\nand out-of-catalog term'
+    ax.text(0.02, 0.98, note_text,
            transform=ax.transAxes, fontsize=9,
            verticalalignment='top', bbox=dict(boxstyle='round', 
            facecolor='wheat', alpha=0.5))
@@ -695,25 +917,56 @@ def main():
         H0_median_std, H0_16_std, H0_84_std = compute_quantiles(posterior_std, H0_grid)
         map_idx = np.argmax(posterior_std)
         H0_map_std = H0_grid[map_idx]
-        print(f"Standard LCDM:")
+        print(f"Standard LCDM (separable mode):")
         print(f"  H₀ (median) = {H0_median_std:.1f} +{H0_84_std - H0_median_std:.1f} -{H0_median_std - H0_16_std:.1f} km/s/Mpc")
         print(f"  H₀ (MAP) = {H0_map_std:.1f} km/s/Mpc")
+        
+        if args.compare_3d and 'std_3d' in results:
+            posterior_std_3d, _, _ = results['std_3d']
+            H0_median_std_3d, H0_16_std_3d, H0_84_std_3d = compute_quantiles(posterior_std_3d, H0_grid)
+            map_idx_3d = np.argmax(posterior_std_3d)
+            H0_map_std_3d = H0_grid[map_idx_3d]
+            print(f"Standard LCDM (3D skymap mode):")
+            print(f"  H₀ (median) = {H0_median_std_3d:.1f} +{H0_84_std_3d - H0_median_std_3d:.1f} -{H0_median_std_3d - H0_16_std_3d:.1f} km/s/Mpc")
+            print(f"  H₀ (MAP) = {H0_map_std_3d:.1f} km/s/Mpc")
+            print(f"  Difference: MAP(3D) - MAP(separable) = {H0_map_std_3d - H0_map_std:.1f} km/s/Mpc")
     
-    # Print summary for all ELL models
-    ell_keys = [k for k in results.keys() if k.startswith('ell_kappa_')]
-    if ell_keys:
-        ell_keys_sorted = sorted(ell_keys, key=lambda k: float(k.split('_')[-1]))
-        for key in ell_keys_sorted:
+    # Print summary for all ELL models (separable)
+    ell_keys_sep = [k for k in results.keys() if k.startswith('ell_kappa_') and not k.endswith('_3d')]
+    if ell_keys_sep:
+        ell_keys_sep_sorted = sorted(ell_keys_sep, key=lambda k: float(k.split('_')[-1]))
+        for key in ell_keys_sep_sorted:
             posterior_ell, _, _, kappa = results[key]
             H0_median_ell, H0_16_ell, H0_84_ell = compute_quantiles(posterior_ell, H0_grid)
             map_idx = np.argmax(posterior_ell)
             H0_map_ell = H0_grid[map_idx]
             if kappa == 0.0:
-                print(f"ELL (κ={kappa:.1f}, should match STD):")
+                print(f"ELL separable (κ={kappa:.1f}, should match STD):")
             else:
-                print(f"ELL (κ={kappa:.1f}):")
+                print(f"ELL separable (κ={kappa:.1f}):")
             print(f"  H₀ (median) = {H0_median_ell:.1f} +{H0_84_ell - H0_median_ell:.1f} -{H0_median_ell - H0_16_ell:.1f} km/s/Mpc")
             print(f"  H₀ (MAP) = {H0_map_ell:.1f} km/s/Mpc")
+    
+    # Print summary for all ELL models (3D)
+    if args.compare_3d:
+        ell_keys_3d = [k for k in results.keys() if k.startswith('ell_kappa_') and k.endswith('_3d')]
+        if ell_keys_3d:
+            ell_keys_3d_sorted = sorted(ell_keys_3d, key=lambda k: float(k.split('_')[-2]))  # Extract kappa before '_3d'
+            for key in ell_keys_3d_sorted:
+                posterior_ell_3d, _, _, kappa = results[key]
+                H0_median_ell_3d, H0_16_ell_3d, H0_84_ell_3d = compute_quantiles(posterior_ell_3d, H0_grid)
+                map_idx = np.argmax(posterior_ell_3d)
+                H0_map_ell_3d = H0_grid[map_idx]
+                print(f"ELL 3D (κ={kappa:.1f}):")
+                print(f"  H₀ (median) = {H0_median_ell_3d:.1f} +{H0_84_ell_3d - H0_median_ell_3d:.1f} -{H0_median_ell_3d - H0_16_ell_3d:.1f} km/s/Mpc")
+                print(f"  H₀ (MAP) = {H0_map_ell_3d:.1f} km/s/Mpc")
+                # Compare with separable if available
+                key_sep = f'ell_kappa_{kappa}'
+                if key_sep in results:
+                    _, _, _, _ = results[key_sep]
+                    map_idx_sep = np.argmax(results[key_sep][0])
+                    H0_map_ell_sep = H0_grid[map_idx_sep]
+                    print(f"  Difference: MAP(3D) - MAP(separable) = {H0_map_ell_3d - H0_map_ell_sep:.1f} km/s/Mpc")
     
     print(f"\nDone!")
 
