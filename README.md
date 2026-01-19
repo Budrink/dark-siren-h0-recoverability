@@ -1,4 +1,4 @@
-# EPJ C H0 Depth-Drift Analysis
+# H0 Depth-Drift Analysis
 
 Reproducible analysis project for testing apparent H0 "depth-drift" effects in gravitational-wave cosmology.
 
