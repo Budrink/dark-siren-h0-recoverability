@@ -277,3 +277,7 @@ Before archiving on Zenodo, you can verify:
    - `python scripts/window_sensitivity_h0.py --event GW191204_171526-v1`
 
 If all of the above complete and produce figures / CSVs in `figures/` and `results/`, the README is consistent with the current code and the archive is ready for Zenodo.
+
+## License
+
+This project is distributed under the **MIT License**. See the `LICENSE` file for details.
